@@ -1,0 +1,21 @@
+{
+    "name": "@lumeweb/relay-plugin-letsencrypt",
+    "type": "module",
+    "version": "0.1.0",
+    "scripts": {
+        "build": "node build.js"
+    },
+    "devDependencies": {
+        "@lumeweb/relay-types": "https://github.com/LumeWeb/relay-types.git",
+        "@types/node": "^18.7.16",
+        "@types/node-cron": "^3.0.4",
+        "@types/sprintf-js": "^1.1.2",
+        "esbuild": "^0.15.5"
+    },
+    "dependencies": {
+        "acme-client": "^5.0.0",
+        "date-fns": "^2.29.2",
+        "node-cron": "^3.0.2",
+        "sprintf-js": "^1.1.2"
+    }
+}
