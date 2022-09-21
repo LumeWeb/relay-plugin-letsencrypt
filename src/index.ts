@@ -3,28 +3,32 @@ import type {
   Plugin,
   PluginAPI,
   SavedSslData,
-  SslData,
 } from "@lumeweb/relay-types";
 import { intervalToDuration } from "date-fns";
 import acme from "acme-client";
 import cron from "node-cron";
 import { sprintf } from "sprintf-js";
+import { Mutex } from "async-mutex";
 
 const FILE_ACCOUNT_KEY_NAME = "/lumeweb/relay/account.key";
+
+let needsBoot = true;
+
+const renewMutex = new Mutex();
 
 const plugin: Plugin = {
   name: "letsencrypt-ssl",
   async plugin(api: PluginAPI): Promise<void> {
-    await bootup(api);
+    api.ssl.setCheck(async () => {
+      await check(api, needsBoot);
+      needsBoot = false;
+    });
     cron.schedule("0 * * * *", async () => check(api));
   },
 };
 
-async function bootup(api: PluginAPI) {
-  return check(api, true);
-}
-
 async function check(api: PluginAPI, boot = false) {
+  await renewMutex.acquire();
   let [sslData, error] = await isSslValid(api, boot);
   sslData = sslData as SavedSslData;
   if (!error) {
@@ -36,17 +40,19 @@ async function check(api: PluginAPI, boot = false) {
       let configDomain = api.config.str("domain");
       api.logger.info(`Loaded SSL Certificate for ${configDomain}`);
     }
+    await renewMutex.release();
     return;
   }
 
   await createOrRenewSSl(api, sslData.cert, sslData.key);
+  await renewMutex.release();
 }
 
 async function isSslValid(
   api: PluginAPI,
   boot: boolean
 ): Promise<[SavedSslData, boolean]> {
-  let sslData = await api.ssl.getSaved(boot);
+  let sslData = await api.ssl.getSaved(!boot);
   let domainValid = false;
   let dateValid = false;
   let configDomain = api.config.str("domain");
