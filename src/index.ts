@@ -19,6 +19,7 @@ const renewMutex = new Mutex();
 const plugin: Plugin = {
   name: "letsencrypt-ssl",
   async plugin(api: PluginAPI): Promise<void> {
+    api.config.set("ssl", true);
     api.ssl.setCheck(async () => {
       await check(api, needsBoot);
       needsBoot = false;
