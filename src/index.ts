@@ -1,183 +1,169 @@
-import type {
-  IndependentFileSmall,
-  Plugin,
-  PluginAPI,
-  SavedSslData,
-} from "@lumeweb/relay-types";
+import type { Plugin, PluginAPI } from "@lumeweb/interface-relay";
 import { intervalToDuration } from "date-fns";
-import acme from "acme-client";
+import acme, { Authorization } from "acme-client";
 import cron from "node-cron";
 import { sprintf } from "sprintf-js";
 import { Mutex } from "async-mutex";
-
-const FILE_ACCOUNT_KEY_NAME = "/lumeweb/relay/account.key";
-
-let needsBoot = true;
+import fs from "fs";
+import path from "path";
+import { Challenge } from "acme-client/types/rfc8555.js";
+import { ca, tr } from "date-fns/locale";
+import { FastifyInstance } from "fastify";
 
 const renewMutex = new Mutex();
+let configDir: string;
+let sslKeyPath: string;
+let sslCertPath: string;
+let sslCert: string;
+let sslKey: string;
+let sslCsr: Buffer;
+let client: acme.Client;
+
+const acmeChallenges = new Map<string, string>();
 
 const plugin: Plugin = {
-  name: "letsencrypt-ssl",
+  name: "letsencrypt",
   async plugin(api: PluginAPI): Promise<void> {
-    api.config.set("ssl", true);
-    api.ssl.setCheck(async () => {
-      await check(api, needsBoot);
-      needsBoot = false;
+    configDir = path.join(api.config.str("core.confdir"), "letsencrypt");
+    sslKeyPath = path.join(configDir, "ssl.key");
+    sslCertPath = path.join(configDir, "ssl.cert");
+
+    if (!fs.existsSync(configDir)) {
+      await fs.promises.mkdir(configDir);
+    }
+
+    try {
+      if (fs.existsSync(sslCertPath)) {
+        sslCert = (await fs.promises.readFile(sslCertPath)).toString("utf-8");
+        api.ssl.cert = acme.crypto.splitPemChain(sslCert);
+      }
+      if (fs.existsSync(sslKeyPath)) {
+        sslKey = (await fs.promises.readFile(sslKeyPath)).toString("utf-8");
+        // @ts-ignore
+        api.ssl.privateKey = sslKey;
+      }
+    } catch {
+      sslCert = undefined as any;
+      sslKey = undefined as any;
+    }
+
+    client = new acme.Client({
+      accountKey: await acme.crypto.createPrivateKey(),
+      directoryUrl: api.pluginConfig.bool("staging")
+        ? acme.directory.letsencrypt.staging
+        : acme.directory.letsencrypt.production,
     });
-    cron.schedule("0 * * * *", async () => check(api));
+
+    api.config.set("core.ssl", true);
+    // @ts-ignore
+    api.ssl.renewHandler = check.bind(undefined, api);
+
+    api.waitFor("core.appServer.buildRoutes").then(() => {
+      api.app.get(
+        "/.well-known/acme-challenge/:token",
+        // @ts-ignore
+        (req: any, res: any) => {
+          if (acmeChallenges.has(req.params.token)) {
+            res.send(acmeChallenges.get(req.params.token));
+            return;
+          }
+          res.code(404);
+          res.send();
+        }
+      );
+      check(api);
+      cron.schedule("0 * * * *", async () => check(api));
+    });
   },
 };
 
-async function check(api: PluginAPI, boot = false) {
-  await renewMutex.acquire();
-  let [sslData, error] = await isSslValid(api, boot);
-  sslData = sslData as SavedSslData;
-  if (!error) {
-    api.ssl.set(
-      sslData.cert as IndependentFileSmall,
-      sslData.key as IndependentFileSmall
-    );
-    if (boot) {
-      let configDomain = api.config.str("domain");
-      api.logger.info(`Loaded SSL Certificate for ${configDomain}`);
-    }
-    await renewMutex.release();
+async function check(api: PluginAPI) {
+  if (!sslCert || !sslKey) {
+    return renew(api);
+  }
+
+  let domainValid = false;
+  let dateValid = false;
+  // @ts-ignore
+  let configDomain = api.ssl.domain;
+
+  let certInfo = await acme.forge.readCertificateInfo(sslCert);
+  const expires = certInfo?.notAfter as Date;
+  let duration = intervalToDuration({ start: new Date(), end: expires });
+  let daysLeft = (duration.months as number) * 30 + (duration.days as number);
+
+  if (daysLeft > 30) {
+    dateValid = true;
+  }
+
+  if (certInfo?.domains.commonName === configDomain) {
+    domainValid = true;
+  }
+
+  if (
+    isSSlStaging(api) !==
+    Boolean(certInfo?.issuer.commonName.toLowerCase().includes("staging"))
+  ) {
+    domainValid = false;
+  }
+
+  if (dateValid && domainValid) {
     return;
   }
 
-  await createOrRenewSSl(api, sslData.cert, sslData.key);
-  await renewMutex.release();
+  return renew(api);
 }
 
-async function isSslValid(
-  api: PluginAPI,
-  boot: boolean
-): Promise<[SavedSslData, boolean]> {
-  let sslData = await api.ssl.getSaved(!boot);
-  let domainValid = false;
-  let dateValid = false;
-  let configDomain = api.config.str("domain");
+async function renew(api: PluginAPI) {
+  await renewMutex.acquire();
+  const result = await client.auto({
+    challengeCreateFn(
+      authz: Authorization,
+      challenge: Challenge,
+      keyAuthorization: string
+    ): Promise<void> {
+      acmeChallenges.set(challenge.token, keyAuthorization);
+      return Promise.resolve();
+    },
+    challengeRemoveFn(
+      authz: Authorization,
+      challenge: Challenge,
+      keyAuthorization: string
+    ): Promise<void> {
+      acmeChallenges.delete(challenge.token);
+      return Promise.resolve();
+    },
+    csr: await generateCsr(api),
+    termsOfServiceAgreed: true,
+  });
 
-  if (sslData) {
-    let certInfo = await acme.forge.readCertificateInfo(
-      Buffer.from((sslData as SavedSslData).cert?.fileData as Uint8Array)
-    );
-    const expires = certInfo?.notAfter as Date;
-    let duration = intervalToDuration({ start: new Date(), end: expires });
-    let daysLeft = (duration.months as number) * 30 + (duration.days as number);
+  await fs.promises.writeFile(sslCertPath, result);
+  // @ts-ignore
+  api.ssl.cert = undefined;
+  api.ssl.privateKey = undefined as any;
+  api.ssl.cert = acme.crypto.splitPemChain(result);
+  // @ts-ignore
+  api.ssl.privateKey = sslKey;
 
-    if (daysLeft > 30) {
-      dateValid = true;
-    }
+  renewMutex.release();
+}
 
-    if (certInfo?.domains.commonName === configDomain) {
-      domainValid = true;
-    }
-
-    if (
-      Boolean(isSSlStaging(api)) !==
-      Boolean(certInfo?.issuer.commonName.toLowerCase().includes("staging"))
-    ) {
-      domainValid = false;
-    }
-
-    if (dateValid && domainValid) {
-      return [sslData as SavedSslData, false];
-    }
-  }
-
-  if (!sslData) {
+async function generateCsr(api: PluginAPI) {
+  let key: Buffer;
+  [key, sslCsr] = await acme.crypto.createCsr({
     // @ts-ignore
-    sslData = { cert: true, key: true };
-  }
-
-  return [sslData as SavedSslData, true];
-}
-
-async function createOrRenewSSl(api: PluginAPI, oldCert?: any, oldKey?: any) {
-  const existing = oldCert && oldKey;
-
-  api.logger.info(
-    sprintf(
-      "%s SSL Certificate for %s",
-      existing ? "Renewing" : "Creating",
-      api.config.str("domain")
-    )
-  );
-
-  let accountKey: boolean | any = await getSslFile(api, FILE_ACCOUNT_KEY_NAME);
-
-  if (accountKey) {
-    accountKey = Buffer.from(accountKey.fileData);
-  }
-
-  if (!accountKey) {
-    accountKey = await acme.forge.createPrivateKey();
-    await api.files.createIndependentFileSmall(
-      api.getSeed(),
-      FILE_ACCOUNT_KEY_NAME,
-      accountKey
-    );
-  }
-
-  let acmeClient = new acme.Client({
-    accountKey: accountKey as Buffer,
-    directoryUrl: isSSlStaging(api)
-      ? acme.directory.letsencrypt.staging
-      : acme.directory.letsencrypt.production,
+    commonName: api.ssl.domain,
   });
 
-  const [certificateKey, certificateRequest] = await acme.forge.createCsr({
-    commonName: api.config.str("domain"),
-  });
+  sslKey = key.toString("utf-8");
 
-  let cert: string | Buffer;
-  try {
-    cert = await acmeClient.auto({
-      csr: certificateRequest,
-      termsOfServiceAgreed: true,
-      challengeCreateFn: async (authz, challenge, keyAuthorization) => {
-        api.appRouter
-          .get()
-          .get(
-            `/.well-known/acme-challenge/${challenge.token}`,
-            (req: any, res: any) => {
-              res.send(keyAuthorization);
-            }
-          );
-      },
-      challengeRemoveFn: async () => {
-        api.appRouter.reset();
-      },
-      challengePriority: ["http-01"],
-    });
-    cert = Buffer.from(cert);
-  } catch (e: any) {
-    console.error((e as Error).message);
-    process.exit(1);
-  }
+  await fs.promises.writeFile(sslKeyPath, sslKey);
 
-  api.ssl.set(cert, certificateKey);
-  await api.ssl.save();
+  return sslCsr;
 }
 
 function isSSlStaging(api: PluginAPI) {
-  return api.config.str("ssl-mode") === "staging";
-}
-
-async function getSslFile(
-  api: PluginAPI,
-  name: string
-): Promise<any | boolean> {
-  let seed = api.getSeed();
-
-  let [file, err] = await api.files.openIndependentFileSmall(seed, name);
-
-  if (err) {
-    return false;
-  }
-
-  return file;
+  return api.pluginConfig.bool("staging");
 }
 
 export default plugin;
